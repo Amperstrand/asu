@@ -1,0 +1,668 @@
+name: Build OpenWrt Firmware
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'OpenWrt Version'
+        required: true
+        default: '23.05.5'
+      device_name:
+        description: 'Device Name (e.g. "GL.iNet GL-MT3000" or blank if using profile_id)'
+        required: false
+      profile_id:
+        description: 'Profile ID (e.g. "glinet_gl-mt3000" - use if you know exact profile)'
+        required: false
+      target:
+        description: 'Target (e.g. "mediatek/filogic" - required if using profile_id)'
+        required: false
+      custom_packages:
+        description: 'Additional custom packages (space-separated)'
+        required: false
+        default: 'luci luci-ssl'
+      rootfs_size_mb:
+        description: 'Custom rootfs size in MB (optional)'
+        required: false
+      disable_default_packages:
+        description: 'Set to "true" to use only specified packages'
+        required: false
+        default: 'false'
+
+permissions:
+  contents: read
+  id-token: write # Needed for GitHub OIDC token authentication for attestations
+
+jobs:
+  lookup-params:
+    runs-on: ubuntu-latest
+    outputs:
+      target: ${{ steps.extract-params.outputs.target }}
+      profile: ${{ steps.extract-params.outputs.profile }}
+      default_packages: ${{ steps.extract-params.outputs.default_packages }}
+      device_title: ${{ steps.extract-params.outputs.device_title }}
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+          
+      - name: Validate inputs
+        id: validate
+        run: |
+          if [[ -z "${{ github.event.inputs.device_name }}" && (-z "${{ github.event.inputs.profile_id }}" || -z "${{ github.event.inputs.target }}") ]]; then
+            echo "::error::You must provide either a device name OR both profile_id and target"
+            exit 1
+          fi
+          
+          echo "Using direct profile: ${{ github.event.inputs.profile_id != '' && 'true' || 'false' }}"
+          
+      - name: Find device parameters from device name
+        if: "${{ github.event.inputs.device_name != '' }}"
+        run: |
+          pip install requests
+          
+          cat > find_device.py << 'EOF'
+          import requests
+          import json
+          import sys
+          import re
+
+          # Get inputs
+          version = "${{ github.event.inputs.version }}"
+          search_device = "${{ github.event.inputs.device_name }}"
+          
+          print(f"Looking for device: '{search_device}'")
+          print(f"OpenWrt version: '{version}'")
+          
+          # First, get the overview which maps devices to targets
+          overview_url = f"https://downloads.openwrt.org/releases/{version}/.overview.json"
+          print(f"Fetching overview from {overview_url}")
+          
+          try:
+              overview_response = requests.get(overview_url)
+              overview_data = overview_response.json()
+              
+              # Extract information from devices list
+              found_devices = []
+              for device in overview_data.get("devices", []):
+                  # Check if our search string is in the device model or vendor
+                  titles = device.get("titles", [{}])[0]
+                  full_name = f"{titles.get('vendor', '')} {titles.get('model', '')}"
+                  
+                  if (search_device.lower() in full_name.lower() or
+                      search_device.lower() in device.get("id", "").lower()):
+                      found_devices.append({
+                          "id": device.get("id"),
+                          "target": device.get("target"),
+                          "titles": titles,
+                          "full_name": full_name
+                      })
+              
+              if not found_devices:
+                  print(f"No devices found matching '{search_device}'")
+                  sys.exit(1)
+                  
+              if len(found_devices) > 1:
+                  print(f"Found multiple matching devices:")
+                  for i, device in enumerate(found_devices):
+                      print(f"  {i+1}. {device['full_name']} ({device['id']}) - Target: {device['target']}")
+                  # Use the first match
+                  print(f"Using the first match: {found_devices[0]['full_name']}")
+                  
+              # Use the first (or only) matching device
+              device = found_devices[0]
+              target = device["target"]
+              profile_id = device["id"]
+              
+              print(f"Found device: {device['full_name']}")
+              print(f"Target: {target}")
+              print(f"Profile ID: {profile_id}")
+              
+              # Now get default packages from the profile
+              profiles_url = f"https://downloads.openwrt.org/releases/{version}/targets/{target}/profiles.json"
+              print(f"Fetching profiles from {profiles_url}")
+              
+              profiles_response = requests.get(profiles_url)
+              profiles_data = profiles_response.json()
+              
+              profile_info = profiles_data["profiles"].get(profile_id)
+              if not profile_info:
+                  print(f"Could not find profile {profile_id} in {target}")
+                  sys.exit(1)
+                  
+              default_packages = profile_info.get("default_packages", [])
+              
+              # Save the profile information
+              device_info = {
+                  "target": target,
+                  "profile": profile_id,
+                  "default_packages": default_packages,
+                  "titles": device["titles"],
+                  "device_title": device["full_name"]
+              }
+              
+              with open('device_params.json', 'w') as f:
+                  json.dump(device_info, f, indent=2)
+                  
+              print("Parameters saved to device_params.json")
+              print(f"Default packages: {default_packages}")
+              
+          except Exception as e:
+              print(f"Error finding device: {e}")
+              sys.exit(1)
+          EOF
+          
+          python find_device.py
+
+      - name: Get device parameters from direct profile
+        if: "${{ github.event.inputs.profile_id != '' }}"
+        run: |
+          pip install requests
+          
+          cat > get_profile.py << 'EOF'
+          import requests
+          import json
+          import sys
+          
+          # Get inputs
+          version = "${{ github.event.inputs.version }}"
+          target = "${{ github.event.inputs.target }}"
+          profile_id = "${{ github.event.inputs.profile_id }}"
+          
+          print(f"Using direct profile ID: '{profile_id}'")
+          print(f"Target: '{target}'")
+          print(f"OpenWrt version: '{version}'")
+          
+          try:
+              # Get default packages from the profile
+              profiles_url = f"https://downloads.openwrt.org/releases/{version}/targets/{target}/profiles.json"
+              print(f"Fetching profiles from {profiles_url}")
+              
+              profiles_response = requests.get(profiles_url)
+              profiles_data = profiles_response.json()
+              
+              profile_info = profiles_data["profiles"].get(profile_id)
+              if not profile_info:
+                  print(f"Could not find profile {profile_id} in {target}")
+                  sys.exit(1)
+                  
+              default_packages = profile_info.get("default_packages", [])
+              
+              # Get device title
+              titles = profile_info.get("titles", [{}])
+              if titles:
+                  first_title = titles[0]
+                  device_title = f"{first_title.get('vendor', '')} {first_title.get('model', '')}"
+              else:
+                  device_title = profile_id
+              
+              # Save the profile information
+              device_info = {
+                  "target": target,
+                  "profile": profile_id,
+                  "default_packages": default_packages,
+                  "device_title": device_title.strip()
+              }
+              
+              with open('device_params.json', 'w') as f:
+                  json.dump(device_info, f, indent=2)
+                  
+              print("Parameters saved to device_params.json")
+              print(f"Default packages: {default_packages}")
+              print(f"Device title: {device_title}")
+              
+          except Exception as e:
+              print(f"Error getting profile: {e}")
+              sys.exit(1)
+          EOF
+          
+          python get_profile.py
+      
+      - name: Extract parameters
+        id: extract-params
+        run: |
+          target=$(cat device_params.json | jq -r '.target')
+          profile=$(cat device_params.json | jq -r '.profile')
+          default_packages=$(cat device_params.json | jq -c '.default_packages')
+          device_title=$(cat device_params.json | jq -r '.device_title')
+          
+          echo "target=$target" >> $GITHUB_OUTPUT
+          echo "profile=$profile" >> $GITHUB_OUTPUT
+          echo "default_packages=$default_packages" >> $GITHUB_OUTPUT
+          echo "device_title=$device_title" >> $GITHUB_OUTPUT
+          
+          echo "Found device parameters:"
+          echo "Target: $target"
+          echo "Profile: $profile"
+          echo "Device: $device_title"
+          echo "Default packages: $default_packages"
+
+  build:
+    needs: lookup-params
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout ASU repository
+        uses: actions/checkout@v3
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+          
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libncurses5-dev libncursesw5-dev \
+            zlib1g-dev gawk git gettext libssl-dev xsltproc rsync wget unzip python3 \
+            file
+          
+          pip install poetry
+          poetry config virtualenvs.create false
+          poetry install
+
+      - name: Configure environment
+        run: |
+          mkdir -p public/store
+          echo "PUBLIC_PATH=$(pwd)/public" > .env
+          echo "CONTAINER_BACKEND=docker" >> .env
+          echo "CONTAINER_SOCKET_PATH=/var/run/docker.sock" >> .env
+          echo "ALLOW_DEFAULTS=1" >> .env
+          echo "DEBUG=1" >> .env
+          
+      - name: Create patch script
+        run: |
+          cat > patch_asu.py << 'EOF'
+          import os
+          import re
+          import sys
+          
+          def patch_file(file_path, find_pattern, replace_pattern):
+              # Patch a file by replacing a pattern.
+              if not os.path.exists(file_path):
+                  print(f"File not found: {file_path}")
+                  return False
+                  
+              with open(file_path, 'r') as f:
+                  content = f.read()
+                  
+              if find_pattern not in content:
+                  print(f"Pattern not found in {file_path}")
+                  return False
+                  
+              modified = content.replace(find_pattern, replace_pattern)
+              
+              with open(file_path, 'w') as f:
+                  f.write(modified)
+                  
+              print(f"Patched {file_path}")
+              return True
+              
+          # Create a dummy module to replace Redis queue functionality
+          with open('asu/dummy_rq.py', 'w') as f:
+              f.write("""
+          class DummyJob:
+              def __init__(self):
+                  self.meta = {}
+                  
+              def save_meta(self):
+                  pass
+                  
+          def get_current_job():
+              return DummyJob()
+          """)
+          
+          # Modify build.py to use dummy job
+          with open('asu/build.py', 'r') as f:
+              build_content = f.read()
+          
+          # Replace RQ import with our dummy
+          modified_build = build_content.replace(
+              "from rq import get_current_job",
+              "from asu.dummy_rq import get_current_job"
+          )
+          
+          # Fix references to Redis in build function
+          modified_build = modified_build.replace(
+              "job = job or get_current_job()",
+              "job = job or get_current_job() if job else get_current_job()"
+          )
+          
+          with open('asu/build.py', 'w') as f:
+              f.write(modified_build)
+              
+          # Modify util.py to bypass Redis
+          with open('asu/util.py', 'r') as f:
+              util_content = f.read()
+              
+          # Remove or bypass Redis imports and functions
+          modified_util = util_content.replace(
+              "import redis", 
+              "# import redis"
+          )
+          
+          # Find and replace the add_timestamp function
+          timestamp_pattern = r'def add_timestamp\(key, data=None\):[^}]*?redis_client = redis\.from_url.*?{json\.dumps\(data or \{\}\): time\(\)}\)'
+          timestamp_replacement = '''def add_timestamp(key, data=None):
+    # Add current timestamp to stats - dummy version
+    # No Redis in GitHub Actions
+    pass'''
+          
+          modified_util = re.sub(timestamp_pattern, timestamp_replacement, modified_util, flags=re.DOTALL)
+          
+          # Find and replace the report_error function
+          error_pattern = r'def report_error\(job, error_message: str\):[^}]*?job\.save_meta\(\)[^}]*?raise Exception\(error_message\)'
+          error_replacement = '''def report_error(job, error_message: str):
+    # Report error in the job metadata and raise an exception
+    if job:
+        job.meta.update({
+            "imagebuilder_status": "fail",
+            "error_message": error_message,
+            "detail": "fail",
+        })
+        if hasattr(job, "save_meta"):
+            job.save_meta()
+
+    print(f"ERROR: {error_message}")
+    raise Exception(error_message)'''
+          
+          modified_util = re.sub(error_pattern, error_replacement, modified_util, flags=re.DOTALL)
+          
+          with open('asu/util.py', 'w') as f:
+              f.write(modified_util)
+          
+          print("ASU patched to run without Redis and RQ")
+          EOF
+      
+      - name: Patch ASU for direct builds
+        run: python patch_asu.py
+      
+      - name: Build firmware
+        id: build
+        run: |
+          # Use the parameters we found
+          target="${{ needs.lookup-params.outputs.target }}"
+          profile="${{ needs.lookup-params.outputs.profile }}"
+          device_title="${{ needs.lookup-params.outputs.device_title }}"
+          
+          # Combine default packages with custom packages or use only custom packages
+          if [[ "${{ github.event.inputs.disable_default_packages }}" == "true" ]]; then
+            echo "Using only custom packages (default packages disabled)"
+            packages=$(python -c "
+            import json
+            custom = '${{ github.event.inputs.custom_packages }}'.split()
+            print(json.dumps(custom))
+            ")
+          else
+            echo "Combining default and custom packages"
+            packages=$(python -c "
+            import json
+            default = json.loads('${{ needs.lookup-params.outputs.default_packages }}')
+            custom = '${{ github.event.inputs.custom_packages }}'.split()
+            all_packages = list(set(default + custom))
+            print(json.dumps(all_packages))
+            ")
+          fi
+          
+          echo "Using target: $target"
+          echo "Using profile: $profile"
+          echo "Device: $device_title"
+          echo "Using packages: $packages"
+          
+          # Create request JSON with optional rootfs size
+          if [[ -n "${{ github.event.inputs.rootfs_size_mb }}" ]]; then
+            cat > build_request.json << EOF
+          {
+            "version": "${{ github.event.inputs.version }}",
+            "target": "$target",
+            "profile": "$profile",
+            "packages": $packages,
+            "diff_packages": true,
+            "rootfs_size_mb": ${{ github.event.inputs.rootfs_size_mb }}
+          }
+          EOF
+          else
+            cat > build_request.json << EOF
+          {
+            "version": "${{ github.event.inputs.version }}",
+            "target": "$target",
+            "profile": "$profile",
+            "packages": $packages,
+            "diff_packages": true
+          }
+          EOF
+          fi
+          
+          # Debug information
+          echo "Build request:"
+          cat build_request.json
+          
+          # Create a simple build script to avoid YAML escaping issues
+          cat > run_build.py << 'EOF'
+          import json
+          import os
+          import sys
+          import traceback
+          import glob
+          from pathlib import Path
+          from asu.build_request import BuildRequest
+          from asu.build import build
+
+          try:
+              print('Loading build request from build_request.json')
+              with open('build_request.json') as f:
+                  req_data = json.load(f)
+              
+              print('Creating BuildRequest object')
+              request = BuildRequest(**req_data)
+              
+              print('Starting build process')
+              result = build(request)
+              
+              print('Build completed successfully')
+              print(json.dumps(result, indent=2))
+              
+              # Save build result to a file
+              with open('build_result.json', 'w') as f:
+                  json.dump(result, f, indent=2)
+              
+              # Create a summary of files produced
+              bin_dir = result.get('bin_dir')
+              if (bin_dir and os.path.isdir(f'public/store/{bin_dir}')):
+                  file_list = []
+                  for filepath in glob.glob(f'public/store/{bin_dir}/**/*', recursive=True):
+                      if os.path.isfile(filepath):
+                          file_size = os.path.getsize(filepath)
+                          file_type = os.popen(f'file -b "{filepath}"').read().strip()
+                          rel_path = os.path.relpath(filepath, f'public/store/{bin_dir}')
+                          file_list.append({
+                              'path': rel_path,
+                              'size': file_size,
+                              'type': file_type
+                          })
+                  
+                  with open('firmware_files.json', 'w') as f:
+                      json.dump(file_list, f, indent=2)
+                  
+                  print(f'Found {len(file_list)} firmware files:')
+                  for file_info in file_list:
+                      print(f"- {file_info['path']} ({file_info['size']} bytes)")
+                  
+              print('Build result saved to build_result.json')
+          except Exception as e:
+              print(f'Error during build: {e}')
+              traceback.print_exc()
+              sys.exit(1)
+          EOF
+          
+          # Run the build script
+          python run_build.py
+          
+          # Extract request_hash
+          request_hash=$(grep -o '"bin_dir": "[^"]*"' build_result.json | cut -d'"' -f4)
+          echo "request_hash=${request_hash}" >> $GITHUB_OUTPUT
+          
+          # Get a summary of files produced
+          if [ -f firmware_files.json ]; then
+            echo "Firmware files produced:"
+            cat firmware_files.json | jq -r '.[] | "- \(.path) (\(.size) bytes)"'
+          fi
+          
+      - name: Generate SBOM
+        id: sbom
+        run: |
+          # Install cyclonedx-cli for SBOM generation
+          pip install cyclonedx-bom
+          
+          # Create SBOM from the packages
+          cat > generate_sbom.py << 'EOF'
+          import json
+          import sys
+          import uuid
+          from datetime import datetime
+
+          # Load build result and packages
+          with open('build_result.json', 'r') as f:
+              build_data = json.load(f)
+              
+          with open('build_request.json', 'r') as f:
+              request_data = json.load(f)
+              
+          # Extract all packages from manifest
+          packages = []
+          for pkg_name, pkg_info in build_data.get('manifest', {}).items():
+              packages.append({
+                  "type": "library",
+                  "name": pkg_name,
+                  "version": pkg_info.get('Version', 'unknown'),
+                  "purl": f"pkg:openwrt/{pkg_name}@{pkg_info.get('Version', 'unknown')}",
+                  "description": pkg_info.get('Description', ''),
+                  "properties": [
+                      {"name": "integrity", "value": pkg_info.get('SHA256sum', '')}
+                  ]
+              })
+
+          # Create CycloneDX SBOM
+          sbom = {
+              "bomFormat": "CycloneDX",
+              "specVersion": "1.4",
+              "serialNumber": f"urn:uuid:{uuid.uuid4()}",
+              "version": 1,
+              "metadata": {
+                  "timestamp": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+                  "tools": [
+                      {
+                          "vendor": "OpenWrt",
+                          "name": "ASU GitHub Action",
+                          "version": "1.0"
+                      }
+                  ],
+                  "component": {
+                      "type": "firmware",
+                      "name": f"OpenWrt {request_data['version']} for {request_data['profile']}",
+                      "version": build_data.get('version_code', request_data['version']),
+                      "purl": f"pkg:openwrt/firmware/{request_data['profile']}@{request_data['version']}"
+                  }
+              },
+              "components": packages
+          }
+
+          with open('firmware-sbom.json', 'w') as f:
+              json.dump(sbom, f, indent=2)
+          EOF
+          
+          python generate_sbom.py
+          echo "Generated SBOM for the firmware build"
+      
+      # Generate attestation for the build 
+      - name: Generate build attestation
+        id: attestation
+        run: |
+          cat > build_attestation.json << EOF
+          {
+            "firmware": {
+              "name": "${{ needs.lookup-params.outputs.profile }}",
+              "device": "${{ needs.lookup-params.outputs.device_title }}",
+              "version": "${{ github.event.inputs.version }}",
+              "target": "${{ needs.lookup-params.outputs.target }}",
+              "build_id": "${{ github.run_id }}",
+              "build_date": "$(date -u "+%Y-%m-%d %H:%M:%S UTC")",
+              "request_hash": "${{ steps.build.outputs.request_hash }}",
+              "builder": "GitHub Actions",
+              "workflow_ref": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            },
+            "source": {
+              "repository": "${{ github.repository }}",
+              "revision": "${{ github.sha }}",
+              "workflow": "${{ github.workflow }}"
+            },
+            "packages": {
+              "custom_packages": "${{ github.event.inputs.custom_packages }}",
+              "default_packages_enabled": ${{ github.event.inputs.disable_default_packages != 'true' }}
+            },
+            "attestation_version": "1.0",
+            "attestation_id": "$(uuidgen)"
+          }
+          EOF
+      
+      - name: Create metadata file
+        run: |
+          cat > firmware_metadata.txt << EOF
+          OpenWrt Firmware Build Information
+          =================================
+          
+          Device: ${{ needs.lookup-params.outputs.device_title }}
+          Profile: ${{ needs.lookup-params.outputs.profile }}
+          Target: ${{ needs.lookup-params.outputs.target }}
+          Version: ${{ github.event.inputs.version }}
+          
+          Build Date: $(date -u "+%Y-%m-%d %H:%M:%S UTC")
+          Request Hash: ${{ steps.build.outputs.request_hash }}
+          Build ID: ${{ github.run_id }}
+          
+          Custom Packages: ${{ github.event.inputs.custom_packages }}
+          
+          Attestation: This firmware was built by GitHub Actions.
+          Build logs: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          
+          EOF
+          
+      - name: Archive all build files
+        uses: actions/upload-artifact@v3
+        with:
+          name: openwrt-build-files
+          path: |
+            public/store/${{ steps.build.outputs.request_hash }}
+            firmware_metadata.txt
+            firmware-sbom.json
+            build_attestation.json
+          
+      - name: Upload sysupgrade image
+        uses: actions/upload-artifact@v3
+        with:
+          name: ${{ needs.lookup-params.outputs.profile }}-${{ github.event.inputs.version }}-sysupgrade
+          path: |
+            public/store/${{ steps.build.outputs.request_hash }}/*sysupgrade.bin
+            public/store/${{ steps.build.outputs.request_hash }}/*.manifest
+            firmware_metadata.txt
+            firmware-sbom.json
+            build_attestation.json
+          if-no-files-found: ignore
+          
+      - name: Upload factory image
+        uses: actions/upload-artifact@v3
+        with:
+          name: ${{ needs.lookup-params.outputs.profile }}-${{ github.event.inputs.version }}-factory
+          path: |
+            public/store/${{ steps.build.outputs.request_hash }}/*factory.bin
+            public/store/${{ steps.build.outputs.request_hash }}/*factory.img
+            public/store/${{ steps.build.outputs.request_hash }}/*.manifest
+            firmware_metadata.txt
+            firmware-sbom.json
+            build_attestation.json
+          if-no-files-found: ignore
+          
+      # Add SLSA provenance generation (GitHub's builtin attestation)
+      - name: Generate provenance
+        uses: actions/generate-provenance@v1
+        with:
+          artifact-name: openwrt-build-files
