@@ -2,20 +2,45 @@ name: Test podman-compose.yml
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 on:
   push:
-    branches:
-      - main
   pull_request:
     branches:
       - main
+  workflow_dispatch:
+    inputs:
+      upstream_url:
+        description: 'OpenWrt upstream URL'
+        default: 'https://downloads.openwrt.org'
+        required: false
+        type: string
+      version:
+        description: 'OpenWrt version'
+        default: '24.10.0'
+        required: false
+        type: string
+      target:
+        description: 'Device target'
+        default: 'mediatek/filogic'
+        required: false
+        type: string
+      profile:
+        description: 'Device profile'
+        default: 'openwrt_one'
+        required: false
+        type: string
 
 env:
   TERM: xterm-color
   PY_COLORS: 1
   LOG_LEVEL: DEBUG
+  # Default values if not provided through workflow_dispatch
+  UPSTREAM_URL: ${{ github.event.inputs.upstream_url || 'https://downloads.openwrt.org' }}
+  VERSION: ${{ github.event.inputs.version || '23.05.5' }}
+  TARGET: ${{ github.event.inputs.target || 'ath79/generic' }}
+  PROFILE: ${{ github.event.inputs.profile || '8dev_carambola2' }}
 
 jobs:
   build:
@@ -39,6 +64,7 @@ jobs:
           podman system service --time=0 "unix://$CONTAINER_SOCKET_PATH" &
           echo "PUBLIC_PATH=$(pwd)/public" > .env
           echo "CONTAINER_SOCKET_PATH=$CONTAINER_SOCKET_PATH" >> .env
+          echo "UPSTREAM_URL=${{ env.UPSTREAM_URL }}" >> .env
           podman-compose up -d
 
       - name: Let the containers start
@@ -50,12 +76,36 @@ jobs:
           [ "$(jq -r '.queue_length' response.json)" -eq 0 ] || exit 1
 
       - name: Test build
+        id: build
         run: |
+          # Create dynamic build request JSON based on parameters
+          cat > build-request.json << EOF
+          {
+            "profile": "${{ env.PROFILE }}",
+            "target": "${{ env.TARGET }}",
+            "version": "${{ env.VERSION }}",
+            "packages": ["luci"],
+            "diff_packages": false,
+            "client": "ci"
+          }
+          EOF
+          
+          # Log the generated build request
+          echo "Generated build request:"
+          cat build-request.json | jq
+          
           for i in {1..20}; do
-            curl 'http://localhost:8000/api/v1/build' \
+            curl --verbose 'http://localhost:8000/api/v1/build' \
               --request 'POST' \
               --header 'Content-Type: application/json' \
-              --data @tests/ci/openwrt-one-24.10.0.json | tee response.json | jq
+              --data @build-request.json | tee response.json | jq
+            
+            # Extract request hash for artifact saving
+            request_hash=$(jq -r '.request_hash // ""' response.json)
+            if [ -n "$request_hash" ]; then
+              echo "request_hash=$request_hash" >> $GITHUB_OUTPUT
+            fi
+            
             if [ "$(jq -r '.status' response.json)" -eq 200 ]; then
               break
             fi
@@ -64,3 +114,147 @@ jobs:
             fi
             sleep 10
           done
+
+      # Wait for build to complete if request hash was obtained
+      - name: Wait for build to complete
+        if: steps.build.outputs.request_hash != ''
+        run: |
+          request_hash="${{ steps.build.outputs.request_hash }}"
+          echo "Waiting for build with hash $request_hash to complete..."
+          
+          for i in {1..30}; do
+            echo "Checking build status (attempt $i)..."
+            curl -s "http://localhost:8000/api/v1/build/$request_hash" | tee status.json | jq
+            
+            detail=$(jq -r '.detail // ""' status.json)
+            if [ "$detail" = "done" ]; then
+              echo "Build completed successfully"
+              break
+            fi
+            
+            if [ $i -eq 30 ]; then
+              echo "Timeout waiting for build to complete, will try to save artifacts anyway"
+            fi
+            
+            echo "Waiting for build to complete..."
+            sleep 10
+          done
+
+      # List the artifacts that were created
+      - name: List build artifacts
+        if: steps.build.outputs.request_hash != ''
+        run: |
+          echo "Listing build artifacts in public/store/${{ steps.build.outputs.request_hash }}"
+          ls -la public/store/${{ steps.build.outputs.request_hash }}
+          
+      # Extract firmware files with proper file type detection
+      - name: Extract firmware files
+        if: steps.build.outputs.request_hash != ''
+        run: |
+          cd public/store/${{ steps.build.outputs.request_hash }}
+          mkdir -p unzipped
+          
+          # List all files and identify their types
+          echo "Files in build directory:"
+          ls -la
+          
+          # Check file types using 'file' command and extract accordingly
+          for f in *; do
+            if [ -f "$f" ]; then
+              echo "Checking file type of $f:"
+              file_type=$(file "$f")
+              echo "$file_type"
+              
+              if [[ "$file_type" == *"Zip archive"* ]]; then
+                echo "Extracting ZIP file $f..."
+                unzip -o "$f" -d unzipped/
+              elif [[ "$file_type" == *"gzip compressed"* || "$file_type" == *"tar archive"* ]]; then
+                echo "Extracting tar/gzip file $f..."
+                tar -xf "$f" -C unzipped/
+              elif [[ "$file_type" == *"XZ compressed"* ]]; then
+                echo "Extracting XZ file $f..."
+                tar -xJf "$f" -C unzipped/
+              elif [[ "$file_type" == *"bzip2 compressed"* ]]; then
+                echo "Extracting bzip2 file $f..."
+                tar -xjf "$f" -C unzipped/
+              else
+                echo "No recognized archive format for $f, copying file as-is..."
+                cp "$f" unzipped/
+              fi
+            fi
+          done
+          
+          # List all files after extraction
+          echo "Files after extraction:"
+          find unzipped -type f | sort
+
+      # Upload individual firmware files
+      - name: Upload individual firmware files
+        if: steps.build.outputs.request_hash != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-bin-files
+          path: |
+            public/store/${{ steps.build.outputs.request_hash }}/unzipped/**/*.bin
+            public/store/${{ steps.build.outputs.request_hash }}/unzipped/**/*.img
+            public/store/${{ steps.build.outputs.request_hash }}/unzipped/**/*.gz
+            public/store/${{ steps.build.outputs.request_hash }}/unzipped/**/*.trx
+          if-no-files-found: warn
+          
+      # Upload firmware metadata files
+      - name: Upload firmware metadata files
+        if: steps.build.outputs.request_hash != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-metadata
+          path: |
+            public/store/${{ steps.build.outputs.request_hash }}/unzipped/**/*.info
+            public/store/${{ steps.build.outputs.request_hash }}/unzipped/**/*.manifest
+            public/store/${{ steps.build.outputs.request_hash }}/unzipped/**/sha256sums
+          if-no-files-found: warn
+
+      # Generate attestation file with checksums
+      - name: Generate attestation file
+        if: steps.build.outputs.request_hash != ''
+        run: |
+          cd public/store/${{ steps.build.outputs.request_hash }}/unzipped
+          
+          # Create attestation directory
+          mkdir -p ../attestation
+          
+          # Generate checksums for all files
+          find . -type f -exec sha256sum {} \; > ../attestation/SHA256SUMS
+          
+          # Create attestation metadata
+          cat > ../attestation/attestation.json << EOF
+          {
+            "build_id": "${{ github.run_id }}",
+            "build_date": "$(date -u +'%Y-%m-%dT%H:%M:%SZ')",
+            "git_commit": "${{ github.sha }}",
+            "git_ref": "${{ github.ref }}",
+            "request_hash": "${{ steps.build.outputs.request_hash }}",
+            "workflow": "${{ github.workflow }}"
+          }
+          EOF
+          
+          # Format the JSON if jq is available
+          if command -v jq >/dev/null 2>&1; then
+            jq . ../attestation/attestation.json > ../attestation/attestation.json.tmp && mv ../attestation/attestation.json.tmp ../attestation/attestation.json
+          fi
+
+      # Upload attestation files
+      - name: Upload attestation files
+        if: steps.build.outputs.request_hash != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-attestation
+          path: public/store/${{ steps.build.outputs.request_hash }}/attestation/
+          if-no-files-found: warn
+
+      # Save artifacts when we have a request hash
+      - name: Save build artifacts
+        if: steps.build.outputs.request_hash != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: openwrt-firmware
+          path: public/store/${{ steps.build.outputs.request_hash }}
